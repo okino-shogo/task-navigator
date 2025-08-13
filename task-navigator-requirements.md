@@ -375,3 +375,21 @@
 - SuperClaudeでAI支援による開発作業の自動化
 - CalendarKitの型衝突に注意しながら実装
 - ADHDユーザーのフィードバックを重視
+
+### コンカレンシー/型衝突の実装注意点（頻出エラー対策）
+
+- **Swift Concurrency の `Task` と自前 `Task` 構造体の衝突**
+  - 症状: 「Trailing closure passed to parameter of type 'any Decoder' that does not accept a closure」
+  - 原因: `Task { ... }` が自前 `struct Task` と解釈されるため
+  - 対策: 非同期起動は必ず `_Concurrency.Task { ... }` を使用する
+
+- **`@MainActor` 分離イニシャライザの呼び出し**
+  - 症状: 「Call to main actor-isolated initializer in a synchronous nonisolated context」
+  - 対策: デフォルト引数でのインスタンス化を避け、`init` 本体内で生成する（例: `self.service = service ?? Service()`）
+
+- **外部からの UI/状態更新**
+  - 原則: UI関連の状態更新は `@MainActor` 上で行う。バックグラウンドで値が届く場合は `_Concurrency.Task { @MainActor in ... }`
+
+- **命名ルール**
+  - 自前モデル `Task` を参照する場所では必ずモジュール名修飾（例: `NaviNavi.Task`）。
+  - 併用時は「`_Concurrency.Task` = 非同期、`NaviNavi.Task` = ドメインモデル」として書き分ける。
