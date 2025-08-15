@@ -1,0 +1,335 @@
+name: NaviNavi CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch: # Allow manual trigger
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+  IOS_SIMULATOR_NAME: "iPhone 15"
+  IOS_SIMULATOR_OS: "17.5"
+
+jobs:
+  # Job 1: Code Quality Checks
+  code-quality:
+    name: Code Quality & Linting
+    runs-on: macos-14
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Xcode
+      uses: maxim-lobanov/setup-xcode@v1
+      with:
+        xcode-version: '15.4'
+        
+    - name: Cache Swift Package Manager
+      uses: actions/cache@v4
+      with:
+        path: |
+          .build
+          ~/Library/Developer/Xcode/DerivedData
+        key: ${{ runner.os }}-spm-${{ hashFiles('NaviNavi/Package.swift', 'NaviNavi/Package.resolved') }}
+        restore-keys: |
+          ${{ runner.os }}-spm-
+          
+    - name: Install SwiftLint
+      run: |
+        if ! which swiftlint > /dev/null; then
+          brew install swiftlint
+        fi
+        swiftlint version
+        
+    - name: Run SwiftLint
+      run: |
+        chmod +x scripts/swiftlint.sh
+        ./scripts/swiftlint.sh
+        
+    - name: Check Swift Package Dependencies
+      run: |
+        cd NaviNavi
+        swift package resolve
+        
+    - name: Validate Xcode project
+      run: |
+        cd NaviNavi
+        xcodebuild -list
+        
+  # Job 2: Unit & Integration Tests
+  tests:
+    name: Unit & Integration Tests
+    runs-on: macos-14
+    needs: code-quality
+    
+    strategy:
+      matrix:
+        destination:
+          - "platform=iOS Simulator,name=iPhone 15,OS=17.5"
+          - "platform=iOS Simulator,name=iPhone 15 Pro,OS=17.5"
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Xcode
+      uses: maxim-lobanov/setup-xcode@v1
+      with:
+        xcode-version: '15.4'
+        
+    - name: Cache Swift Package Manager
+      uses: actions/cache@v4
+      with:
+        path: |
+          .build
+          ~/Library/Developer/Xcode/DerivedData
+        key: ${{ runner.os }}-spm-${{ hashFiles('NaviNavi/Package.swift', 'NaviNavi/Package.resolved') }}
+        restore-keys: |
+          ${{ runner.os }}-spm-
+          
+    - name: List available simulators
+      run: xcrun simctl list devices available
+      
+    - name: Boot simulator
+      run: |
+        SIMULATOR_ID=$(xcrun simctl list devices available | grep "$IOS_SIMULATOR_NAME" | grep "$IOS_SIMULATOR_OS" | head -1 | sed 's/.*(\([^)]*\)).*/\1/')
+        echo "Booting simulator: $SIMULATOR_ID"
+        xcrun simctl boot "$SIMULATOR_ID" || true
+        xcrun simctl list devices | grep "$IOS_SIMULATOR_NAME"
+        
+    - name: Build for testing
+      run: |
+        cd NaviNavi
+        xcodebuild build-for-testing \
+          -scheme NaviNavi \
+          -destination "${{ matrix.destination }}" \
+          -configuration Debug \
+          -derivedDataPath DerivedData \
+          CODE_SIGNING_REQUIRED=NO \
+          CODE_SIGNING_ALLOWED=NO
+          
+    - name: Run unit tests
+      run: |
+        cd NaviNavi
+        xcodebuild test-without-building \
+          -scheme NaviNavi \
+          -destination "${{ matrix.destination }}" \
+          -configuration Debug \
+          -derivedDataPath DerivedData \
+          -resultBundlePath TestResults \
+          CODE_SIGNING_REQUIRED=NO \
+          CODE_SIGNING_ALLOWED=NO
+          
+    - name: Generate test coverage report
+      if: matrix.destination == 'platform=iOS Simulator,name=iPhone 15,OS=17.5'
+      run: |
+        cd NaviNavi
+        xcrun xccov view DerivedData/Logs/Test/*.xcresult --report --json > coverage.json
+        xcrun xccov view DerivedData/Logs/Test/*.xcresult --report
+        
+    - name: Upload test coverage to Codecov
+      if: matrix.destination == 'platform=iOS Simulator,name=iPhone 15,OS=17.5'
+      uses: codecov/codecov-action@v4
+      with:
+        file: NaviNavi/coverage.json
+        token: ${{ secrets.CODECOV_TOKEN }}
+        fail_ci_if_error: false
+        
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-results-${{ matrix.destination }}
+        path: NaviNavi/TestResults
+        retention-days: 7
+        
+  # Job 3: UI Tests
+  ui-tests:
+    name: UI Tests
+    runs-on: macos-14
+    needs: code-quality
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Xcode
+      uses: maxim-lobanov/setup-xcode@v1
+      with:
+        xcode-version: '15.4'
+        
+    - name: Cache Swift Package Manager
+      uses: actions/cache@v4
+      with:
+        path: |
+          .build
+          ~/Library/Developer/Xcode/DerivedData
+        key: ${{ runner.os }}-spm-${{ hashFiles('NaviNavi/Package.swift', 'NaviNavi/Package.resolved') }}
+        restore-keys: |
+          ${{ runner.os }}-spm-
+          
+    - name: Boot simulator for UI tests
+      run: |
+        SIMULATOR_ID=$(xcrun simctl list devices available | grep "$IOS_SIMULATOR_NAME" | grep "$IOS_SIMULATOR_OS" | head -1 | sed 's/.*(\([^)]*\)).*/\1/')
+        echo "Booting simulator: $SIMULATOR_ID"
+        xcrun simctl boot "$SIMULATOR_ID" || true
+        # Wait for simulator to boot
+        sleep 30
+        
+    - name: Run UI tests
+      run: |
+        cd NaviNavi
+        xcodebuild test \
+          -scheme NaviNaviUITests \
+          -destination "platform=iOS Simulator,name=$IOS_SIMULATOR_NAME,OS=$IOS_SIMULATOR_OS" \
+          -configuration Debug \
+          -resultBundlePath UITestResults \
+          CODE_SIGNING_REQUIRED=NO \
+          CODE_SIGNING_ALLOWED=NO
+          
+    - name: Upload UI test results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: ui-test-results
+        path: NaviNavi/UITestResults
+        retention-days: 7
+        
+  # Job 4: Build for Distribution (Release builds)
+  build-distribution:
+    name: Build for Distribution
+    runs-on: macos-14
+    needs: [tests, ui-tests]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Xcode
+      uses: maxim-lobanov/setup-xcode@v1
+      with:
+        xcode-version: '15.4'
+        
+    - name: Cache Swift Package Manager
+      uses: actions/cache@v4
+      with:
+        path: |
+          .build
+          ~/Library/Developer/Xcode/DerivedData
+        key: ${{ runner.os }}-spm-${{ hashFiles('NaviNavi/Package.swift', 'NaviNavi/Package.resolved') }}
+        restore-keys: |
+          ${{ runner.os }}-spm-
+          
+    - name: Build release version
+      run: |
+        cd NaviNavi
+        xcodebuild archive \
+          -scheme NaviNavi \
+          -archivePath NaviNavi.xcarchive \
+          -configuration Release \
+          CODE_SIGNING_REQUIRED=NO \
+          CODE_SIGNING_ALLOWED=NO
+          
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: release-build
+        path: NaviNavi/NaviNavi.xcarchive
+        retention-days: 30
+        
+  # Job 5: Dependency Security Scan
+  security-scan:
+    name: Security & Dependency Scan
+    runs-on: macos-14
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Xcode
+      uses: maxim-lobanov/setup-xcode@v1
+      with:
+        xcode-version: '15.4'
+        
+    - name: Install dependency-check (OWASP)
+      run: |
+        brew install dependency-check
+        
+    - name: Run dependency security scan
+      run: |
+        cd NaviNavi
+        swift package resolve
+        dependency-check --project NaviNavi --scan . --format JSON --format HTML
+        
+    - name: Upload security scan results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: security-scan-results
+        path: NaviNavi/dependency-check-report.*
+        retention-days: 30
+        
+  # Job 6: Documentation Generation
+  documentation:
+    name: Generate Documentation
+    runs-on: macos-14
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Xcode
+      uses: maxim-lobanov/setup-xcode@v1
+      with:
+        xcode-version: '15.4'
+        
+    - name: Install swift-docc-plugin
+      run: |
+        cd NaviNavi
+        swift package --allow-writing-to-directory docs generate-documentation --target NaviNavi --disable-indexing --transform-for-static-hosting --hosting-base-path NaviNavi --output-path docs
+        
+    - name: Deploy to GitHub Pages
+      uses: peaceiris/actions-gh-pages@v3
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        publish_dir: NaviNavi/docs
+        
+  # Job 7: Notification & Reporting
+  notify:
+    name: Notification & Reporting
+    runs-on: ubuntu-latest
+    needs: [code-quality, tests, ui-tests, security-scan]
+    if: always()
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Generate build report
+      run: |
+        echo "# NaviNavi Build Report" > build_report.md
+        echo "" >> build_report.md
+        echo "## Build Status" >> build_report.md
+        echo "- Code Quality: ${{ needs.code-quality.result }}" >> build_report.md
+        echo "- Tests: ${{ needs.tests.result }}" >> build_report.md  
+        echo "- UI Tests: ${{ needs.ui-tests.result }}" >> build_report.md
+        echo "- Security Scan: ${{ needs.security-scan.result }}" >> build_report.md
+        echo "" >> build_report.md
+        echo "## Build Details" >> build_report.md
+        echo "- Branch: ${{ github.ref_name }}" >> build_report.md
+        echo "- Commit: ${{ github.sha }}" >> build_report.md
+        echo "- Triggered by: ${{ github.event_name }}" >> build_report.md
+        echo "- Build time: $(date)" >> build_report.md
+        
+    - name: Upload build report
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-report
+        path: build_report.md
+        retention-days: 90
